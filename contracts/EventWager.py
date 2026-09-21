@@ -3,6 +3,7 @@
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from genlayer import *
 from urllib.parse import urlparse
 
@@ -10,11 +11,13 @@ from urllib.parse import urlparse
 DATE_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 HTTPS = "https://"
 MAX_PAGE_CHARS = 12000
-MIN_CLAIM_CHARS = 12
+MIN_QUESTION_CHARS = 12
 
 ALLOWED_HOSTS = (
     "bbc.com",
     "www.bbc.com",
+    "espn.com",
+    "www.espn.com",
     "reuters.com",
     "www.reuters.com",
     "apnews.com",
@@ -23,32 +26,32 @@ ALLOWED_HOSTS = (
     "www.theguardian.com",
     "nytimes.com",
     "www.nytimes.com",
-    "espn.com",
-    "www.espn.com",
     "skysports.com",
     "www.skysports.com",
+    "goal.com",
+    "www.goal.com",
+    "flashscore.com",
+    "www.flashscore.com",
+    "sofascore.com",
+    "www.sofascore.com",
+    "cbssports.com",
+    "www.cbssports.com",
+    "nfl.com",
+    "www.nfl.com",
+    "nba.com",
+    "www.nba.com",
+    "mlb.com",
+    "www.mlb.com",
+    "nhl.com",
+    "www.nhl.com",
+    "fifa.com",
+    "www.fifa.com",
+    "uefa.com",
+    "www.uefa.com",
+    "premierleague.com",
+    "www.premierleague.com",
     "en.wikipedia.org",
     "wikipedia.org",
-    "sec.gov",
-    "www.sec.gov",
-    "nasa.gov",
-    "www.nasa.gov",
-    "who.int",
-    "www.who.int",
-    "un.org",
-    "www.un.org",
-    "europa.eu",
-    "www.europa.eu",
-)
-
-ALLOWED_SUFFIXES = (
-    ".gov",
-    ".gov.uk",
-    ".gouv.fr",
-    ".gob.mx",
-    ".gc.ca",
-    ".europa.eu",
-    ".int",
 )
 
 
@@ -64,9 +67,6 @@ def _host_allowed(url: str) -> bool:
         base = allowed[4:] if allowed.startswith("www.") else allowed
         if host == allowed or host == base or host.endswith("." + base):
             return True
-    for suffix in ALLOWED_SUFFIXES:
-        if host.endswith(suffix):
-            return True
     return False
 
 
@@ -75,8 +75,12 @@ def _require_https_url(url: str, label: str) -> str:
     if not cleaned.lower().startswith(HTTPS):
         raise gl.vm.UserError(f"{label} must be an https url")
     if not _host_allowed(cleaned):
-        raise gl.vm.UserError(f"{label} host is not an allowed official source")
+        raise gl.vm.UserError(f"{label} host is not on the source allowlist")
     return cleaned
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _pay(to: Address, amount: u256) -> None:
@@ -87,10 +91,13 @@ def _pay(to: Address, amount: u256) -> None:
 
 @allow_storage
 @dataclass
-class Attestation:
-    attester: Address
-    claim: str
+class Wager:
+    creator: Address
+    joiner: Address
+    question: str
     event_date: str
+    resolve_after: str
+    creator_side: str
     source_url_a: str
     source_url_b: str
     stake: u256
@@ -99,33 +106,38 @@ class Attestation:
     funds_disposition: str
 
 
-class AttestLock(gl.Contract):
-    attestations: TreeMap[str, Attestation]
-    next_attestation_id: u256
+class EventWager(gl.Contract):
+    wagers: TreeMap[str, Wager]
+    next_wager_id: u256
     reserved_stakes: u256
-    retained_stakes: u256
 
     def __init__(self):
-        self.next_attestation_id = u256(1)
+        self.next_wager_id = u256(1)
         self.reserved_stakes = u256(0)
-        self.retained_stakes = u256(0)
 
     def _id(self) -> str:
-        return str(int(self.next_attestation_id))
+        return str(int(self.next_wager_id))
 
-    def _get(self, attestation_id: str) -> Attestation:
-        if attestation_id not in self.attestations:
-            raise gl.vm.UserError("attestation not found")
-        return self.attestations[attestation_id]
+    def _get(self, wager_id: str) -> Wager:
+        if wager_id not in self.wagers:
+            raise gl.vm.UserError("wager not found")
+        return self.wagers[wager_id]
 
-    def _extract_page(self, url: str, claim: str, event_date: str) -> dict:
+    def _ensure_resolvable(self, wager: Wager) -> None:
+        today = _today_utc()
+        if today < wager.resolve_after:
+            raise gl.vm.UserError(
+                "wager cannot be closed before resolve_after " + wager.resolve_after
+            )
+
+    def _extract_page(self, url: str, question: str, event_date: str) -> dict:
         raw = gl.nondet.web.render(url, mode="text")
         page_text = raw if isinstance(raw, str) else str(raw)
         page_text = page_text[:MAX_PAGE_CHARS]
         prompt = f"""
-Decide whether one official public page supports a dated factual claim.
+Decide whether one public page answers a dated yes/no event question.
 
-Claim: {claim}
+Question: {question}
 Required calendar date (YYYY-MM-DD): {event_date}
 Source URL: {url}
 
@@ -138,14 +150,6 @@ Return JSON only with exactly these fields:
   "related": true or false,
   "answer": "YES" or "NO" or "UNKNOWN"
 }}
-
-Rules:
-- date_match is true only if the page is about that calendar day.
-- related is true only if the page is about the same fact as the claim.
-- answer is YES if the page clearly supports that the claim is true.
-- answer is NO if the page clearly supports that the claim is false.
-- answer is UNKNOWN if the page is incomplete, off-topic, undated, or inconclusive.
-- Do not include any other keys or commentary.
 """
         parsed = gl.nondet.exec_prompt(prompt, response_format="json")
         if isinstance(parsed, str):
@@ -157,16 +161,12 @@ Rules:
             answer = "UNKNOWN"
         if not date_match or not related:
             answer = "UNKNOWN"
-        return {
-            "date_match": date_match,
-            "related": related,
-            "answer": answer,
-        }
+        return {"date_match": date_match, "related": related, "answer": answer}
 
-    def _adjudicate(self, item: Attestation) -> dict:
+    def _adjudicate(self, wager: Wager) -> dict:
         def decide() -> str:
-            page_a = self._extract_page(item.source_url_a, item.claim, item.event_date)
-            page_b = self._extract_page(item.source_url_b, item.claim, item.event_date)
+            page_a = self._extract_page(wager.source_url_a, wager.question, wager.event_date)
+            page_b = self._extract_page(wager.source_url_b, wager.question, wager.event_date)
             if (
                 not page_a["date_match"]
                 or not page_b["date_match"]
@@ -194,18 +194,27 @@ Rules:
         return json.loads(gl.eq_principle.strict_eq(decide))
 
     @gl.public.write.payable
-    def create_attestation(
+    def create_wager(
         self,
-        claim: str,
+        question: str,
         event_date: str,
+        resolve_after: str,
+        side: str,
         source_url_a: str,
         source_url_b: str,
     ) -> str:
-        text = claim.strip()
-        if len(text) < MIN_CLAIM_CHARS:
-            raise gl.vm.UserError("claim is too short")
+        text = question.strip()
+        if len(text) < MIN_QUESTION_CHARS:
+            raise gl.vm.UserError("question is too short")
         if re.match(DATE_RE, event_date.strip()) is None:
             raise gl.vm.UserError("event_date must be YYYY-MM-DD")
+        if re.match(DATE_RE, resolve_after.strip()) is None:
+            raise gl.vm.UserError("resolve_after must be YYYY-MM-DD")
+        if resolve_after.strip() < event_date.strip():
+            raise gl.vm.UserError("resolve_after must be on or after event_date")
+        side_u = side.strip().upper()
+        if side_u not in ("YES", "NO"):
+            raise gl.vm.UserError("side must be YES or NO")
         url_a = _require_https_url(source_url_a, "source_url_a")
         url_b = _require_https_url(source_url_b, "source_url_b")
         if _host(url_a) == _host(url_b):
@@ -214,11 +223,14 @@ Rules:
         if stake == u256(0):
             raise gl.vm.UserError("stake must be greater than zero")
 
-        attestation_id = self._id()
-        self.attestations[attestation_id] = Attestation(
-            attester=gl.message.sender_address,
-            claim=text,
+        wager_id = self._id()
+        self.wagers[wager_id] = Wager(
+            creator=gl.message.sender_address,
+            joiner=Address("0x0000000000000000000000000000000000000000"),
+            question=text,
             event_date=event_date.strip(),
+            resolve_after=resolve_after.strip(),
+            creator_side=side_u,
             source_url_a=url_a,
             source_url_b=url_b,
             stake=stake,
@@ -226,102 +238,110 @@ Rules:
             verdict="",
             funds_disposition="RESERVED",
         )
-        self.next_attestation_id = self.next_attestation_id + u256(1)
+        self.next_wager_id = self.next_wager_id + u256(1)
         self.reserved_stakes = self.reserved_stakes + stake
-        return attestation_id
+        return wager_id
+
+    @gl.public.write.payable
+    def join(self, wager_id: str) -> None:
+        wager = self._get(wager_id)
+        if wager.status != "OPEN":
+            raise gl.vm.UserError("wager is not open")
+        if gl.message.sender_address == wager.creator:
+            raise gl.vm.UserError("creator cannot join")
+        if gl.message.value != wager.stake:
+            raise gl.vm.UserError("join stake must match")
+        wager.joiner = gl.message.sender_address
+        wager.status = "MATCHED"
+        self.reserved_stakes = self.reserved_stakes + wager.stake
+        self.wagers[wager_id] = wager
 
     @gl.public.write
-    def update_sources(
-        self,
-        attestation_id: str,
-        source_url_a: str,
-        source_url_b: str,
-    ) -> None:
-        item = self._get(attestation_id)
-        if gl.message.sender_address != item.attester:
-            raise gl.vm.UserError("only the attester can update sources")
-        if item.status != "OPEN":
-            raise gl.vm.UserError("only an open attestation can change sources")
-        url_a = _require_https_url(source_url_a, "source_url_a")
-        url_b = _require_https_url(source_url_b, "source_url_b")
-        if _host(url_a) == _host(url_b):
-            raise gl.vm.UserError("sources must come from two different hosts")
-        item.source_url_a = url_a
-        item.source_url_b = url_b
-        self.attestations[attestation_id] = item
-
-    @gl.public.write
-    def cancel(self, attestation_id: str) -> None:
-        item = self._get(attestation_id)
-        if gl.message.sender_address != item.attester:
-            raise gl.vm.UserError("only the attester can cancel")
-        if item.status != "OPEN":
-            raise gl.vm.UserError("only an open attestation can be cancelled")
-        stake = item.stake
-        item.status = "CANCELLED"
-        item.funds_disposition = "REFUNDED_TO_ATTESTER"
+    def cancel(self, wager_id: str) -> None:
+        wager = self._get(wager_id)
+        if gl.message.sender_address != wager.creator:
+            raise gl.vm.UserError("only the creator can cancel")
+        if wager.status == "MATCHED":
+            raise gl.vm.UserError("matched wagers can only close after resolve_after via resolve")
+        if wager.status != "OPEN":
+            raise gl.vm.UserError("only an open unmatched wager can be cancelled")
+        stake = wager.stake
+        wager.status = "CANCELLED"
+        wager.funds_disposition = "REFUNDED_TO_CREATOR"
         self.reserved_stakes = self.reserved_stakes - stake
-        self.attestations[attestation_id] = item
-        _pay(item.attester, stake)
+        self.wagers[wager_id] = wager
+        _pay(wager.creator, stake)
 
     @gl.public.write
-    def resolve(self, attestation_id: str) -> str:
-        item = self._get(attestation_id)
-        if item.status != "OPEN":
-            raise gl.vm.UserError("attestation must be OPEN to resolve")
-        result = self._adjudicate(item)
+    def resolve(self, wager_id: str) -> str:
+        wager = self._get(wager_id)
+        if wager.status != "MATCHED":
+            raise gl.vm.UserError("wager must be MATCHED to resolve")
+        self._ensure_resolvable(wager)
+        result = self._adjudicate(wager)
         verdict = str(result.get("verdict", "UNKNOWN")).upper()
-        stake = item.stake
+        pot = wager.stake + wager.stake
+        self.reserved_stakes = self.reserved_stakes - pot
 
         if verdict == "YES":
-            item.status = "ATTESTED"
-            item.verdict = "YES"
-            item.funds_disposition = "RETURNED_TO_ATTESTER"
-            self.reserved_stakes = self.reserved_stakes - stake
-            self.attestations[attestation_id] = item
-            _pay(item.attester, stake)
+            winner = wager.creator if wager.creator_side == "YES" else wager.joiner
+            wager.status = "SETTLED"
+            wager.verdict = "YES"
+            wager.funds_disposition = "PAID_TO_WINNER"
+            self.wagers[wager_id] = wager
+            _pay(winner, pot)
         elif verdict == "NO":
-            item.status = "REJECTED"
-            item.verdict = "NO"
-            item.funds_disposition = "RETAINED_BY_CONTRACT"
-            self.reserved_stakes = self.reserved_stakes - stake
-            self.retained_stakes = self.retained_stakes + stake
-            self.attestations[attestation_id] = item
+            winner = wager.creator if wager.creator_side == "NO" else wager.joiner
+            wager.status = "SETTLED"
+            wager.verdict = "NO"
+            wager.funds_disposition = "PAID_TO_WINNER"
+            self.wagers[wager_id] = wager
+            _pay(winner, pot)
         else:
-            item.verdict = verdict if verdict in ("UNKNOWN", "DISAGREE") else "UNKNOWN"
-            self.attestations[attestation_id] = item
-        return item.status if item.status != "OPEN" else item.verdict
+            wager.status = "REFUNDED"
+            wager.verdict = verdict if verdict in ("UNKNOWN", "DISAGREE") else "UNKNOWN"
+            wager.funds_disposition = "REFUNDED_TO_BOTH"
+            self.wagers[wager_id] = wager
+            _pay(wager.creator, wager.stake)
+            _pay(wager.joiner, wager.stake)
+        return wager.status
 
     @gl.public.view
-    def get_attestation(self, attestation_id: str) -> str:
-        item = self._get(attestation_id)
+    def can_resolve(self, wager_id: str) -> str:
+        wager = self._get(wager_id)
+        today = _today_utc()
         return json.dumps(
             {
-                "attester": item.attester.as_hex,
-                "claim": item.claim,
-                "event_date": item.event_date,
-                "source_url_a": item.source_url_a,
-                "source_url_b": item.source_url_b,
-                "stake": str(int(item.stake)),
-                "status": item.status,
-                "verdict": item.verdict,
-                "funds_disposition": item.funds_disposition,
+                "status": wager.status,
+                "event_date": wager.event_date,
+                "resolve_after": wager.resolve_after,
+                "now_utc": today,
+                "allowed": wager.status == "MATCHED" and today >= wager.resolve_after,
             },
             sort_keys=True,
         )
 
     @gl.public.view
-    def get_attestation_status(self, attestation_id: str) -> str:
-        return self._get(attestation_id).status
+    def get_wager(self, wager_id: str) -> str:
+        wager = self._get(wager_id)
+        return json.dumps(
+            {
+                "creator": wager.creator.as_hex,
+                "joiner": wager.joiner.as_hex,
+                "question": wager.question,
+                "event_date": wager.event_date,
+                "resolve_after": wager.resolve_after,
+                "creator_side": wager.creator_side,
+                "source_url_a": wager.source_url_a,
+                "source_url_b": wager.source_url_b,
+                "stake": str(int(wager.stake)),
+                "status": wager.status,
+                "verdict": wager.verdict,
+                "funds_disposition": wager.funds_disposition,
+            },
+            sort_keys=True,
+        )
 
     @gl.public.view
-    def get_attestation_count(self) -> str:
-        return str(int(self.next_attestation_id) - 1)
-
-    @gl.public.view
-    def get_reserved_stakes(self) -> str:
-        return str(int(self.reserved_stakes))
-
-    @gl.public.view
-    def get_retained_stakes(self) -> str:
-        return str(int(self.retained_stakes))
+    def get_wager_count(self) -> str:
+        return str(int(self.next_wager_id) - 1)
